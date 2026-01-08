@@ -1,7 +1,5 @@
 import numpy as np
 from collections import namedtuple
-
-from numpy.lib.arraysetops import isin
 import mediapipe_utils as mpu
 import depthai as dai
 import cv2
@@ -11,16 +9,40 @@ import time
 import sys
 from string import Template
 import marshal
-
+import json
+from importlib import resources as importlib_resources
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-PALM_DETECTION_MODEL = str(SCRIPT_DIR / "models/palm_detection_sh4.blob")
-LANDMARK_MODEL_FULL = str(SCRIPT_DIR / "models/hand_landmark_full_sh4.blob")
-LANDMARK_MODEL_LITE = str(SCRIPT_DIR / "models/hand_landmark_lite_sh4.blob")
-LANDMARK_MODEL_SPARSE = str(SCRIPT_DIR / "models/hand_landmark_sparse_sh4.blob")
-DETECTION_POSTPROCESSING_MODEL = str(SCRIPT_DIR / "custom_models/PDPostProcessing_top2_sh1.blob")
+
+
+def resolve_data_file(relative_path: str) -> str:
+    """
+    Return an absolute path to a resource that might be bundled inside a PyInstaller executable.
+    """
+    candidate = SCRIPT_DIR / relative_path
+    if candidate.exists():
+        return str(candidate)
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        base = Path(meipass)
+        pyinstaller_candidates = [
+            base / relative_path,
+            base / "depthai_hand_tracker" / relative_path,
+        ]
+        for path in pyinstaller_candidates:
+            if path.exists():
+                return str(path)
+    raise FileNotFoundError(f"Resource '{relative_path}' not found (expected at '{candidate}')")
+
+
+PALM_DETECTION_MODEL = resolve_data_file("models/palm_detection_sh4.blob")
+LANDMARK_MODEL_FULL = resolve_data_file("models/hand_landmark_full_sh4.blob")
+LANDMARK_MODEL_LITE = resolve_data_file("models/hand_landmark_lite_sh4.blob")
+LANDMARK_MODEL_SPARSE = resolve_data_file("models/hand_landmark_sparse_sh4.blob")
+DETECTION_POSTPROCESSING_MODEL = resolve_data_file("custom_models/PDPostProcessing_top2_sh1.blob")
 TEMPLATE_MANAGER_SCRIPT_SOLO = str(SCRIPT_DIR / "template_manager_script_solo.py")
 TEMPLATE_MANAGER_SCRIPT_DUO = str(SCRIPT_DIR / "template_manager_script_duo.py")
+DEFAULT_XYZ_LANDMARK_IDS = [8]
 
 
 def to_planar(arr: np.ndarray, shape: tuple) -> np.ndarray:
@@ -93,6 +115,7 @@ class HandTracker:
                 pp_model = DETECTION_POSTPROCESSING_MODEL,
                 solo=True,
                 xyz=False,
+                xyz_landmark_ids=None,
                 crop=False,
                 internal_fps=None,
                 resolution="full",
@@ -133,6 +156,9 @@ class HandTracker:
         else:
             assert lm_nb_threads in [1, 2]
             self.lm_nb_threads = lm_nb_threads
+        if xyz_landmark_ids is None:
+            xyz_landmark_ids = DEFAULT_XYZ_LANDMARK_IDS.copy()
+        self.xyz_landmark_ids = [int(idx) for idx in xyz_landmark_ids]
         self.xyz = False
         self.crop = crop 
         self.use_world_landmarks = use_world_landmarks
@@ -146,15 +172,23 @@ class HandTracker:
 
         self.device = dai.Device()
 
+        self.rgb_calib_lens_pos = None
+
         if input_src == None or input_src == "rgb" or input_src == "rgb_laconic":
             # Note that here (in Host mode), specifying "rgb_laconic" has no effect
             # Color camera frames are systematically transferred to the host
             self.input_type = "rgb" # OAK* internal color camera
             self.laconic = input_src == "rgb_laconic" # Camera frames are not sent to the host
-            if resolution == "full":
+            resolution_key = resolution.lower()
+            if resolution_key == "full":
                 self.resolution = (1920, 1080)
-            elif resolution == "ultra":
+                self.sensor_resolution = dai.ColorCameraProperties.SensorResolution.THE_1080_P
+            elif resolution_key == "ultra":
                 self.resolution = (3840, 2160)
+                self.sensor_resolution = dai.ColorCameraProperties.SensorResolution.THE_4_K
+            elif resolution_key in ("12mp", "12_mp", "twelve_mp"):
+                self.resolution = (4056, 3040)
+                self.sensor_resolution = dai.ColorCameraProperties.SensorResolution.THE_12_MP
             else:
                 print(f"Error: {resolution} is not a valid resolution !")
                 sys.exit()
@@ -165,6 +199,12 @@ class HandTracker:
                 cameras = self.device.getConnectedCameras()
                 if dai.CameraBoardSocket.LEFT in cameras and dai.CameraBoardSocket.RIGHT in cameras:
                     self.xyz = True
+                    try:
+                        calib_data = self.device.readCalibration()
+                        self.rgb_calib_lens_pos = calib_data.getLensPosition(dai.CameraBoardSocket.RGB)
+                    except RuntimeError as e:
+                        print(f"Warning: Unable to read RGB calibration data: {e}")
+                        self.rgb_calib_lens_pos = None
                 else:
                     print("Warning: depth unavailable on this device, 'xyz' argument is ignored")
 
@@ -214,7 +254,8 @@ class HandTracker:
         
         # Define and start pipeline
         usb_speed = self.device.getUsbSpeed()
-        self.device.startPipeline(self.create_pipeline())
+        self.device.close()
+        self.device = dai.Device(self.create_pipeline())
         print(f"Pipeline started - USB speed: {str(usb_speed).split('.')[-1]}")
 
         # Define data queues 
@@ -240,16 +281,12 @@ class HandTracker:
         print("Creating pipeline...")
         # Start defining a pipeline
         pipeline = dai.Pipeline()
-        pipeline.setOpenVINOVersion(version = dai.OpenVINO.Version.VERSION_2021_4)
         self.pd_input_length = 128
 
         # ColorCamera
         print("Creating Color Camera...")
-        cam = pipeline.createColorCamera()
-        if self.resolution[0] == 1920:
-            cam.setResolution(dai.ColorCameraProperties.SensorResolution.THE_1080_P)
-        else:
-            cam.setResolution(dai.ColorCameraProperties.SensorResolution.THE_4_K)
+        cam = pipeline.create(dai.node.ColorCamera)
+        cam.setResolution(self.sensor_resolution)
         cam.setBoardSocket(dai.CameraBoardSocket.RGB)
         cam.setInterleaved(False)
         cam.setIspScale(self.scale_nd[0], self.scale_nd[1])
@@ -277,23 +314,24 @@ class HandTracker:
             print("Creating MonoCameras, Stereo and SpatialLocationCalculator nodes...")
             # For now, RGB needs fixed focus to properly align with depth.
             # The value used during calibration should be used here
-            calib_data = self.device.readCalibration()
-            calib_lens_pos = calib_data.getLensPosition(dai.CameraBoardSocket.RGB)
-            print(f"RGB calibration lens position: {calib_lens_pos}")
-            cam.initialControl.setManualFocus(calib_lens_pos)
+            if self.rgb_calib_lens_pos is not None:
+                print(f"RGB calibration lens position: {self.rgb_calib_lens_pos}")
+                cam.initialControl.setManualFocus(self.rgb_calib_lens_pos)
+            else:
+                print("Warning: RGB calibration lens position unavailable; using default focus.")
 
             mono_resolution = dai.MonoCameraProperties.SensorResolution.THE_400_P
-            left = pipeline.createMonoCamera()
+            left = pipeline.create(dai.node.MonoCamera)
             left.setBoardSocket(dai.CameraBoardSocket.LEFT)
             left.setResolution(mono_resolution)
             left.setFps(self.internal_fps)
 
-            right = pipeline.createMonoCamera()
+            right = pipeline.create(dai.node.MonoCamera)
             right.setBoardSocket(dai.CameraBoardSocket.RIGHT)
             right.setResolution(mono_resolution)
             right.setFps(self.internal_fps)
 
-            stereo = pipeline.createStereoDepth()
+            stereo = pipeline.create(dai.node.StereoDepth)
             stereo.setConfidenceThreshold(230)
             # LR-check is required for depth alignment
             stereo.setLeftRightCheck(True)
@@ -303,7 +341,7 @@ class HandTracker:
             # Otherwise : [critical] Fatal error. Please report to developers. Log: 'StereoSipp' '533'
             # stereo.setMedianFilter(dai.StereoDepthProperties.MedianFilter.MEDIAN_OFF)
 
-            spatial_location_calculator = pipeline.createSpatialLocationCalculator()
+            spatial_location_calculator = pipeline.create(dai.node.SpatialLocationCalculator)
             spatial_location_calculator.setWaitForConfigInput(True)
             spatial_location_calculator.inputDepth.setBlocking(False)
             spatial_location_calculator.inputDepth.setQueueSize(1)
@@ -346,7 +384,7 @@ class HandTracker:
         post_pd_nn.out.link(manager_script.inputs['from_post_pd_nn'])
         
         # Define link to send result to host 
-        manager_out = pipeline.create(dai.node.XLinkOut)
+        manager_out = pipeline.createXLinkOut()
         manager_out.setStreamName("manager_out")
         manager_script.outputs['host'].link(manager_out.input)
 
@@ -386,9 +424,32 @@ class HandTracker:
             - the video frame shape
         So we build this code from the content of the file template_manager_script_*.py which is a python template
         '''
-        # Read the template
-        with open(TEMPLATE_MANAGER_SCRIPT_SOLO if self.solo else TEMPLATE_MANAGER_SCRIPT_DUO, 'r') as file:
-            template = Template(file.read())
+        template_path = Path(TEMPLATE_MANAGER_SCRIPT_SOLO if self.solo else TEMPLATE_MANAGER_SCRIPT_DUO)
+
+        def load_template_text(path: Path):
+            if path.exists():
+                return path.read_text()
+            candidates = []
+            meipass = getattr(sys, "_MEIPASS", None)
+            if meipass:
+                base = Path(meipass)
+                candidates.append(base / path.name)
+                candidates.append(base / "depthai_hand_tracker" / path.name)
+            for candidate in candidates:
+                if candidate.exists():
+                    return candidate.read_text()
+            try:
+                package_name = __package__ or "depthai_hand_tracker"
+                data = importlib_resources.files(package_name).joinpath(path.name).read_text()
+                return data
+            except (FileNotFoundError, ModuleNotFoundError, AttributeError):
+                return None
+
+        template_text = load_template_text(template_path)
+        if template_text is None:
+            raise FileNotFoundError(f"Unable to locate template file '{template_path.name}' for manager script.")
+
+        template = Template(template_text)
         
         # Perform the substitution
         code = template.substitute(
@@ -406,6 +467,7 @@ class HandTracker:
                     _single_hand_tolerance_thresh= self.single_hand_tolerance_thresh,
                     _IF_USE_SAME_IMAGE = "" if self.use_same_image else '"""',
                     _IF_USE_WORLD_LANDMARKS = "" if self.use_world_landmarks else '"""',
+                    _xyz_landmark_ids = json.dumps(self.xyz_landmark_ids),
         )
         # Remove comments and empty lines
         import re
@@ -434,6 +496,18 @@ class HandTracker:
         if self.xyz:
             hand.xyz = np.array(res["xyz"][hand_idx])
             hand.xyz_zone = res["xyz_zone"][hand_idx]
+            hand.landmark_xyz = {}
+            landmark_ids_sets = res.get("landmark_xyz_ids", [])
+            landmark_xyz_sets = res.get("landmark_xyz", [])
+            if hand_idx < len(landmark_ids_sets) and hand_idx < len(landmark_xyz_sets):
+                ids = landmark_ids_sets[hand_idx]
+                coords_list = landmark_xyz_sets[hand_idx]
+                if ids and coords_list:
+                    hand.landmark_xyz = {}
+                    for idx, coords in zip(ids, coords_list):
+                        hand.landmark_xyz[int(idx)] = np.array(coords)
+        else:
+            hand.landmark_xyz = {}
         # If we added padding to make the image square, we need to remove this padding from landmark coordinates and from rect_points
         if self.pad_h > 0:
             hand.landmarks[:,1] -= self.pad_h
