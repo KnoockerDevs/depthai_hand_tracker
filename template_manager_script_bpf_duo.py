@@ -28,6 +28,11 @@ single_hand_count = 0
 body_score_thresh=${_body_score_thresh}
 hands_up_only = ${_hands_up_only}
 
+# Initialize body keypoints (will be updated by movenet_postprocess)
+body_x = [0] * 17
+body_y = [0] * 17
+body_scores = [0.0] * 17
+
 BODY_KP = {
     'nose': 0,
     'left_eye': 1,
@@ -317,13 +322,15 @@ def send_result(result):
 # bd_pd_inf=1 or 2 and nb_lm_inf=0 means the body or palm detection hasn't found any hand
 # bd_pd_inf, nb_lm_inf are used for statistics 
 def send_result_no_hand(bd_pd_inf, nb_lm_inf):
-    result = dict([("bd_pd_inf", bd_pd_inf), ("nb_lm_inf", nb_lm_inf)])
+    result = dict([("bd_pd_inf", bd_pd_inf), ("nb_lm_inf", nb_lm_inf),
+                   ("body_x", body_x), ("body_y", body_y), ("body_scores", body_scores)])
     send_result(result)
 
 def send_result_hands(bd_pd_inf, nb_lm_inf, lm_score, handedness, rect_center_x, rect_center_y, rect_size, rotation, rrn_lms, sqn_lms, world_lms, xyz, xyz_zone):   
     result = dict([("bd_pd_inf", bd_pd_inf), ("nb_lm_inf", nb_lm_inf), ("lm_score", lm_score), ("handedness", handedness), ("rotation", rotation),
             ("rect_center_x", rect_center_x), ("rect_center_y", rect_center_y), ("rect_size", rect_size), ("rrn_lms", rrn_lms), ('sqn_lms', sqn_lms),
-            ("world_lms", world_lms), ("xyz", xyz), ("xyz_zone", xyz_zone)])
+            ("world_lms", world_lms), ("xyz", xyz), ("xyz_zone", xyz_zone),
+            ("body_x", body_x), ("body_y", body_y), ("body_scores", body_scores)])
     send_result(result)
 
 def rr2img(rrn_x, rrn_y):

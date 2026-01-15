@@ -37,7 +37,8 @@ class HandTrackerRenderer:
 
         self.show_xyz_zone = self.show_xyz = self.tracker.xyz
         self.show_fps = True
-        self.show_body = False # self.tracker.body_pre_focusing is not None
+        # Show body skeleton when body_pre_focusing is enabled
+        self.show_body = getattr(self.tracker, 'body_pre_focusing', None) is not None
         self.show_inferences_status = False
 
         if output is None:
@@ -187,7 +188,9 @@ class HandTrackerRenderer:
     def waitKey(self, delay=1):
         if self.show_fps:
                 self.tracker.fps.draw(self.frame, orig=(50,50), size=1, color=(240,180,100))
-        cv2.imshow("Hand tracking", self.frame)
+        # Mirror the display horizontally for natural interaction
+        display_frame = cv2.flip(self.frame, 1)
+        cv2.imshow("Hand tracking", display_frame)
         if self.output:
             self.output.write(self.frame)
         key = cv2.waitKey(delay) 

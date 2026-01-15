@@ -173,10 +173,16 @@ class HandTrackerBpf:
             self.laconic = input_src == "rgb_laconic" # Camera frames are not sent to the host
             if resolution == "full":
                 self.resolution = (1920, 1080)
+                self.sensor_resolution = dai.ColorCameraProperties.SensorResolution.THE_1080_P
             elif resolution == "ultra":
                 self.resolution = (3840, 2160)
+                self.sensor_resolution = dai.ColorCameraProperties.SensorResolution.THE_4_K
+            elif resolution in ("12mp", "12_mp", "twelve_mp"):
+                # 12MP mode for full FOV on OAK-D Pro Wide (150° DFOV)
+                self.resolution = (4056, 3040)
+                self.sensor_resolution = dai.ColorCameraProperties.SensorResolution.THE_12_MP
             else:
-                print(f"Error: {resolution} is not a valid resolution !")
+                print(f"Error: {resolution} is not a valid resolution! Use 'full', 'ultra', or '12mp'")
                 sys.exit()
             print("Sensor resolution:", self.resolution)
 
@@ -272,10 +278,7 @@ class HandTrackerBpf:
         # ColorCamera
         print("Creating Color Camera...")
         cam = pipeline.createColorCamera()
-        if self.resolution[0] == 1920:
-            cam.setResolution(dai.ColorCameraProperties.SensorResolution.THE_1080_P)
-        else:
-            cam.setResolution(dai.ColorCameraProperties.SensorResolution.THE_4_K)
+        cam.setResolution(self.sensor_resolution)
         cam.setBoardSocket(dai.CameraBoardSocket.RGB)
         cam.setInterleaved(False)
         cam.setIspScale(self.scale_nd[0], self.scale_nd[1])
@@ -537,6 +540,36 @@ class HandTrackerBpf:
             hand = self.extract_hand_data(res, i)
             hands.append(hand)
 
+        # Build bag with body data for visualization
+        bag = {}
+        body_x = res.get("body_x")
+        body_y = res.get("body_y")
+        body_scores = res.get("body_scores")
+        
+        if body_x is not None and body_y is not None and body_scores is not None:
+            # Create a simple Body-like object for the renderer
+            # The renderer expects body.keypoints (Nx2 array) and body.scores
+            class BodyData:
+                def __init__(self, keypoints, scores, score_thresh):
+                    self.keypoints = keypoints
+                    self.scores = scores
+                    self.score_thresh = score_thresh
+                    # Create a dummy crop region for renderer compatibility
+                    # (renderer draws this as a yellow rectangle)
+                    self.crop_region = type('CropRegion', (), {
+                        'xmin': 0, 'ymin': 0, 
+                        'xmax': 0, 'ymax': 0, 
+                        'size': 0
+                    })()
+            
+            # Convert body_x, body_y to keypoints array (Nx2)
+            # body_x, body_y are in the source image coordinate system
+            # The crop_region already has ymin=-pad_h offset, so body_y values
+            # are already in the video frame coordinate system (no adjustment needed)
+            keypoints = np.array([[body_x[i], body_y[i]] for i in range(17)], dtype=np.int32)
+            scores = np.array(body_scores, dtype=np.float32)
+            
+            bag["body"] = BodyData(keypoints, scores, self.body_score_thresh)
 
         # Statistics
         if self.stats:
@@ -555,7 +588,7 @@ class HandTrackerBpf:
                 self.nb_lm_inferences += res["nb_lm_inf"]
                 self.nb_failed_lm_inferences += res["nb_lm_inf"] - len(hands)
 
-        return video_frame, hands, None
+        return video_frame, hands, bag
 
 
     def exit(self):

@@ -18,6 +18,9 @@ DEFAULT_CONFIG = {
         "max_missing_frames": 3,
     },
 
+    # Camera type: 'oak' for OAK depth camera, 'rgb' for standard RGB webcam with MediaPipe
+    'camera_type': 'oak',
+
     'tracker': 
     { 
         'version': 'edge',
@@ -137,23 +140,59 @@ class HandController:
         # Keep records of previous pose status 
         self.poses_hist = [EventHist() for i in range(len(self.pose_actions))]
 
-        # HandTracker
-        tracker_version = self.config['tracker']['version']
-        if tracker_version == 'edge':
-            from HandTrackerEdge import HandTracker
-        else: # 'host'
-            from HandTracker import HandTracker
-        # Forcing solo mode and use_gesture
-        self.config['tracker']['args']['solo'] = True
-        self.config['tracker']['args']['use_gesture'] = True
-        # Init tracker
-        self.tracker = HandTracker(**self.config['tracker']['args'])
+        # HandTracker - select based on camera_type
+        camera_type = self.config.get('camera_type', 'oak')
+        
+        if camera_type == 'rgb':
+            # Use MediaPipe for standard RGB webcam
+            from MediaPipeHandTracker import MediaPipeHandTracker
+            # Forcing use_gesture (solo mode is now configurable)
+            self.config['tracker']['args']['use_gesture'] = True
+            # Init MediaPipe tracker
+            self.tracker = MediaPipeHandTracker(**self.config['tracker']['args'])
+        else:
+            # Use OAK depth camera (default)
+            tracker_version = self.config['tracker']['version']
+            tracker_args = self.config['tracker']['args']
+            
+            # Check if body_pre_focusing is requested - use BPF tracker variant
+            use_body_pre_focusing = 'body_pre_focusing' in tracker_args
+            
+            if use_body_pre_focusing:
+                # Use Body Pre-Focusing tracker (includes Movenet body detection)
+                if tracker_version == 'edge':
+                    from HandTrackerBpfEdge import HandTrackerBpf as HandTracker
+                else: # 'host'
+                    from HandTrackerBpf import HandTrackerBpf as HandTracker
+                print("Using HandTrackerBpf (Body Pre-Focusing mode)")
+            else:
+                # Use standard hand tracker
+                if tracker_version == 'edge':
+                    from HandTrackerEdge import HandTracker
+                else: # 'host'
+                    from HandTracker import HandTracker
+            
+            # Forcing use_gesture (solo mode is now configurable)
+            self.config['tracker']['args']['use_gesture'] = True
+            # Init OAK tracker
+            self.tracker = HandTracker(**self.config['tracker']['args'])
+        
+        # On-frame callback (optional)
+        self.on_frame_callback = None
+        if 'on_frame' in self.config:
+            callback_name = self.config['on_frame']
+            if callback_name in self.caller_globals:
+                self.on_frame_callback = self.caller_globals[callback_name]
 
-        # Renderer
+        # Renderer - use appropriate renderer for camera type
         self.use_renderer = self.config['renderer']['enable']
         if self.use_renderer:
-            from HandTrackerRenderer import HandTrackerRenderer
-            self.renderer = HandTrackerRenderer(self.tracker, **self.config['renderer']['args'])
+            if camera_type == 'rgb':
+                from MediaPipeHandTrackerRenderer import MediaPipeHandTrackerRenderer
+                self.renderer = MediaPipeHandTrackerRenderer(self.tracker, **self.config['renderer']['args'])
+            else:
+                from HandTrackerRenderer import HandTrackerRenderer
+                self.renderer = HandTrackerRenderer(self.tracker, **self.config['renderer']['args'])
 
         self.frame_nb = 0
         
@@ -206,17 +245,24 @@ class HandController:
 
         events = []
 
-        # We are in solo mode -> either hands=[] or hands=[hand]
-        hand = hands[0] if hands else None
-
+        # Support both solo mode (1 hand) and duo mode (2 hands)
+        # Find the first matching hand for each pose action
         for i, pa in enumerate(self.pose_actions):
             hist = self.poses_hist[i]
             trigger = pa['trigger']
-            if hand and hand.gesture and \
-                (hand.label == pa['hand'] or pa['hand'] == 'any') and \
-                hand.gesture in pa['pose']:
+            
+            # Find a hand that matches this pose action
+            matching_hand = None
+            for hand in hands:
+                if hand and hand.gesture and \
+                    (hand.label == pa['hand'] or pa['hand'] == 'any') and \
+                    hand.gesture in pa['pose']:
+                    matching_hand = hand
+                    break
+            
+            if matching_hand:
                 if trigger == "continuous":
-                    events.append(PoseEvent(hand, pa, "continuous"))
+                    events.append(PoseEvent(matching_hand, pa, "continuous"))
                 else: # trigger in ["enter", "enter_leave", "periodic"]:
                     if not hist.triggered:
                         if hist.time != 0 and (self.frame_nb - hist.frame_nb <= pa['max_missing_frames']):
@@ -226,11 +272,11 @@ class HandController:
                                 
                                 if trigger == "enter" or trigger == "enter_leave":
                                     hist.triggered = True
-                                    events.append(PoseEvent(hand, pa, "enter"))
+                                    events.append(PoseEvent(matching_hand, pa, "enter"))
                                 else: # "periodic"
                                     hist.time = self.now
                                     hist.first_triggered = True
-                                    events.append(PoseEvent(hand, pa, "periodic"))
+                                    events.append(PoseEvent(matching_hand, pa, "periodic"))
                                 
                         else:
                             hist.time = self.now
@@ -241,7 +287,7 @@ class HandController:
                             hist.triggered = False
                             hist.first_triggered = False
                             if trigger == "enter_leave":
-                                events.append(PoseEvent(hand, pa, "leave"))
+                                events.append(PoseEvent(matching_hand, pa, "leave"))
                 hist.frame_nb = self.frame_nb
 
             else:
@@ -250,7 +296,7 @@ class HandController:
                     hist.triggered = False
                     hist.first_triggered = False 
                     if trigger == "enter_leave":
-                        events.append(PoseEvent(hand, pa, "leave")) 
+                        events.append(PoseEvent(matching_hand, pa, "leave")) 
         return events    
 
     def process_events(self, events):
@@ -266,6 +312,11 @@ class HandController:
             frame, hands, bag = self.tracker.next_frame()
             if frame is None: break
             self.frame_nb += 1
+            
+            # Call on_frame callback if defined (for custom per-frame logic like activation detection)
+            if self.on_frame_callback:
+                self.on_frame_callback(frame, hands, bag)
+            
             events = self.generate_events(hands)
             self.process_events(events)
 
@@ -274,7 +325,8 @@ class HandController:
                 key = self.renderer.waitKey(delay=1)
                 if key == 27 or key == ord('q'):
                     break
-        self.renderer.exit()
+        if self.use_renderer:
+            self.renderer.exit()
         self.tracker.exit()
             
 
